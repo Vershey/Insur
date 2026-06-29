@@ -69,14 +69,28 @@ Step 7 of the pipeline computes a 0–100 score and renders it as a bar — in t
 terminal **and** in the GitHub Actions job summary (see the **Actions** tab after
 any push).
 
-**Terminal output**
+**Terminal output — example for a PENDING claim (Austin water case)**
 ```
 7) CONFIDENCE SCORE
 ------------------------------------------------------------------------------
-  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░]  39/100  (LOW   )
+  [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  11/100  (LOW   )
    0 ←──────────────────────────────────────→ 100
    LOW                                    HIGH
 ```
+
+> **PENDING** means the proximate cause is unconfirmed and no final determination
+> can be issued until a field adjuster investigates. It scores lower than PARTIAL
+> because the claim is not yet resolvable — not merely uncertain.
+
+**All possible decisions at a glance**
+
+| Decision | Meaning | Confidence base |
+|----------|---------|-----------------|
+| `COVERED` | Evidence conclusively supports coverage | 85 |
+| `DENIED` | Evidence conclusively supports denial | 70 |
+| `PARTIAL` | Partial coverage clearly applies; open questions remain | 55 |
+| `PENDING` | Proximate cause unconfirmed; field investigation required | 35 |
+| `ABSTAIN` | Verifier found unsupported claims; escalate to human | 15 |
 
 **GitHub Actions job summary** — the workflow renders an HTML progress bar with
 colour coding that is visible directly on GitHub without opening logs:
@@ -87,13 +101,14 @@ colour coding that is visible directly on GitHub without opening logs:
 | 40 – 69 | **MEDIUM** | 🟡 yellow |
 | < 40 | **LOW** | 🔴 red |
 
-**Scoring formula**
+**Full scoring formula**
 
 | Factor | Effect |
 |--------|--------|
 | Decision = COVERED | base 85 |
 | Decision = DENIED | base 70 |
 | Decision = PARTIAL | base 55 |
+| Decision = PENDING | base 35 |
 | Decision = ABSTAIN | base 15 |
 | `all_supported` is false | − 30 |
 | Each open question | − 8 (max − 24) |
