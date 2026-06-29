@@ -25,7 +25,6 @@ jobs:
         id: copilot
         run: |
           python claims_copilot.py --dry-run | tee /tmp/output.txt
-          # Extract confidence score line
           SCORE=$(grep -oP '\d+(?=/100)' /tmp/output.txt | tail -1)
           echo "score=$SCORE" >> "$GITHUB_OUTPUT"
 
@@ -33,13 +32,11 @@ jobs:
         run: |
           SCORE="${{ steps.copilot.outputs.score }}"
 
-          # Determine label and colour
           if   [ "$SCORE" -ge 70 ]; then LABEL="HIGH";   COLOR="#2ea44f"; BG="#d1f0db";
           elif [ "$SCORE" -ge 40 ]; then LABEL="MEDIUM"; COLOR="#b58900"; BG="#fff3cd";
           else                           LABEL="LOW";    COLOR="#d73a49"; BG="#ffdce0";
           fi
 
-          # Build filled/empty segments (40 cells wide)
           FILLED=$(( SCORE * 40 / 100 ))
           EMPTY=$(( 40 - FILLED ))
           BAR_FILLED=$(printf '█%.0s' $(seq 1 $FILLED) 2>/dev/null || true)
@@ -66,11 +63,11 @@ jobs:
           </tr>
           </table>
 
-          ```
+          \`\`\`
           0                                              100
           [${BAR_FILLED}${BAR_EMPTY}] ${SCORE}/100  (${LABEL})
           LOW                                           HIGH
-          ```
+          \`\`\`
 
           <details>
           <summary>Full pipeline output</summary>

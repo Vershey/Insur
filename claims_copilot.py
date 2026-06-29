@@ -155,19 +155,13 @@ def _tok(text: str) -> list[str]:
 
 
 class HybridRetriever:
-    """Lexical hybrid (BM25 + TF-IDF) with RRF fusion.
-
-    This runs anywhere with no API key or network. To make it a true
-    lexical+semantic hybrid, add an EmbeddingRetriever (Voyage / OpenAI /
-    sentence-transformers) as a third ranked list and fuse it in below.
-    """
+    """Lexical hybrid (BM25 + TF-IDF) with RRF fusion."""
 
     def __init__(self, corpus: list[dict]):
         self.corpus = corpus
         self.ids = [d["id"] for d in corpus]
         toks = [_tok(d["text"] + " " + d["source"]) for d in corpus]
         self.bm25 = BM25Okapi(toks)
-        # --- tiny TF-IDF in numpy (no sklearn needed) ---
         self.vocab = sorted({t for doc in toks for t in doc})
         self.vindex = {t: i for i, t in enumerate(self.vocab)}
         n_docs, n_vocab = len(corpus), len(self.vocab)
@@ -196,7 +190,7 @@ class HybridRetriever:
         return {int(idx): rank for rank, idx in enumerate(order)}
 
     def search(self, queries: list[str], top_k: int = TOP_K_RETRIEVE) -> list[dict]:
-        rrf, k = {}, 60  # standard RRF constant
+        rrf, k = {}, 60
         for q in queries:
             bm_ranks = self._ranks(np.array(self.bm25.get_scores(_tok(q))))
             tf_ranks = self._ranks(self.doc_vecs @ self._tfidf_query_vec(q))
@@ -208,11 +202,9 @@ class HybridRetriever:
 
 
 # --------------------------------------------------------------------------- #
-# Real-time tools (STUBBED). Swap the bodies for live API calls.
-# The container/network must allow egress to the provider's domain.
+# Real-time tools (STUBBED).
 # --------------------------------------------------------------------------- #
 def tool_weather_cat(date: str, location: str) -> dict:
-    # TODO: replace with a live call, e.g. National Weather Service / NOAA.
     return {
         "tool": "weather_cat",
         "date": date,
@@ -224,7 +216,6 @@ def tool_weather_cat(date: str, location: str) -> dict:
 
 
 def tool_sanctions_screen(name: str) -> dict:
-    # TODO: replace with a live screen against the public OFAC SDN list.
     return {"tool": "sanctions_screen", "name": name, "match": False, "list": "OFAC SDN (stubbed)"}
 
 
@@ -232,8 +223,7 @@ TOOLS = {"weather_cat": tool_weather_cat, "sanctions_screen": tool_sanctions_scr
 
 
 # --------------------------------------------------------------------------- #
-# Prompt templates. System prompts are constants; user prompts are built from
-# data at call time. These four prompts ARE the product — tune them here.
+# Prompt templates.
 # --------------------------------------------------------------------------- #
 PLANNER_SYSTEM = """You are the retrieval planner for an insurance claims copilot.
 Given a claim (FNOL), decide what to retrieve and which real-time tools to call.
@@ -278,8 +268,7 @@ Respond with ONLY JSON:
 
 
 # --------------------------------------------------------------------------- #
-# LLM client wrapper. dry_run returns canned JSON so the whole pipeline runs
-# with no key; real mode calls the Anthropic Messages API.
+# LLM client wrapper.
 # --------------------------------------------------------------------------- #
 _MOCKS = {
     "plan": json.dumps({
@@ -332,8 +321,8 @@ class LLM:
 
     def __post_init__(self):
         if not self.dry_run:
-            import anthropic  # imported lazily so dry-run needs nothing
-            self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+            import anthropic
+            self.client = anthropic.Anthropic()
 
     def complete(self, *, step: str, system: str, user: str, model: str) -> str:
         if self.dry_run:
@@ -357,7 +346,6 @@ def parse_json(s: str) -> dict:
 
 # --------------------------------------------------------------------------- #
 # Confidence score: 0 (low) → 100 (high).
-# Derived from the verifier's final decision and faithfulness check.
 # --------------------------------------------------------------------------- #
 def confidence_score(draft: dict, verify: dict) -> int:
     base = {"COVERED": 85, "PARTIAL": 55, "DENIED": 70, "ABSTAIN": 15}.get(
@@ -389,7 +377,6 @@ def render_confidence_bar(score: int, width: int = 40) -> str:
 def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     line = lambda c="-": print(c * 78)
 
-    # 1. PLAN
     plan = parse_json(llm.complete(
         step="plan", system=PLANNER_SYSTEM, model=REASONING_MODEL,
         user=f"<claim>\n{claim}\n</claim>",
@@ -398,13 +385,11 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     print("   queries:", plan["queries"])
     print("   tools  :", plan.get("tools", []))
 
-    # 2. RETRIEVE (hybrid BM25 + TF-IDF + RRF)
     candidates = retriever.search(plan["queries"])
     print("\n2) RETRIEVE (hybrid + RRF)"); line()
     for d in candidates:
         print(f"   [{d['id']:<9}] {d['source']}")
 
-    # 3. RERANK (LLM)
     cand_block = "\n".join(f"[{d['id']}] {d['text']}" for d in candidates)
     rr = parse_json(llm.complete(
         step="rerank", system=RERANK_SYSTEM, model=RERANK_MODEL,
@@ -412,11 +397,10 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     ))
     cand_ids = {d["id"] for d in candidates}
     ordered = [i for i in rr.get("ranked_ids", []) if i in cand_ids]
-    ordered += [i for i in cand_ids if i not in ordered]      # robustness
+    ordered += [i for i in cand_ids if i not in ordered]
     evidence = [ID_TO_DOC[i] for i in ordered[:TOP_N_EVIDENCE]]
     print("\n3) RERANK -> evidence kept:", [d["id"] for d in evidence])
 
-    # 4. REAL-TIME TOOLS
     realtime = {}
     print("\n4) REAL-TIME TOOLS"); line()
     for name in plan.get("tools", []):
@@ -426,7 +410,6 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
             realtime[name] = TOOLS[name]("John Roe")
         print(f"   {name}: {realtime[name]}")
 
-    # 5. DRAFT determination (LLM, grounded + cited)
     ev_block = "\n".join(f"[{d['id']}] ({d['source']}) {d['text']}" for d in evidence)
     draft = parse_json(llm.complete(
         step="draft", system=DRAFTER_SYSTEM, model=REASONING_MODEL,
@@ -434,13 +417,11 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
               f"<realtime>\n{json.dumps(realtime)}\n</realtime>"),
     ))
 
-    # 6. VERIFY (faithfulness gate -> abstain if unsupported)
     verify = parse_json(llm.complete(
         step="verify", system=VERIFIER_SYSTEM, model=REASONING_MODEL,
         user=(f"<draft>\n{json.dumps(draft)}\n</draft>\n<evidence>\n{ev_block}\n</evidence>"),
     ))
 
-    # ---- report ----
     print("\n5) DRAFT DETERMINATION"); line()
     print("   decision :", draft["decision"])
     print("   rationale:", draft["rationale"])
@@ -456,7 +437,6 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     print("   FINAL DECISION:", verify["final_decision"])
     print("   notes         :", verify["notes"])
 
-    # 7. CONFIDENCE SCORE
     score = confidence_score(draft, verify)
     print("\n7) CONFIDENCE SCORE"); line()
     print(render_confidence_bar(score))

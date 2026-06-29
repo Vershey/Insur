@@ -54,7 +54,7 @@ All live near the top of `claims_copilot.py` and are easy to tune:
 - **DRAFTER_SYSTEM** — drafts the determination; every point must cite a `doc_id`.
 - **VERIFIER_SYSTEM** — checks grounding; forces `ABSTAIN` when unsupported.
 
-## Which "advanced RAG" piece is where
+## Which “advanced RAG” piece is where
 - **Agentic** — the planner chooses sources/tools and the verifier can abstain.
 - **Hybrid + RRF** — `HybridRetriever` fuses BM25 and TF-IDF rankings.
 - **Rerank** — `RERANK_SYSTEM` re-scores candidates (swap in a cross-encoder later).
@@ -78,8 +78,9 @@ any push).
    LOW                                    HIGH
 ```
 
-**GitHub Actions job summary** — the workflow renders an HTML progress bar with
-colour coding that is visible directly on GitHub without opening logs:
+**GitHub Actions job summary** — the workflow (`.github/workflows/dry_run.yml`)
+runs on every push and PR. Open **Actions → Claims Copilot — Dry Run → dry-run
+job → Summary** to see a colour-coded HTML progress bar without opening logs:
 
 | Threshold | Label | Colour |
 |-----------|-------|--------|
@@ -108,8 +109,8 @@ downstream use.
    Weather Service for CAT, the public OFAC SDN list for screening). Your runtime
    must allow network egress to those domains.
 3. **GraphRAG** — model policy → coverage → exclusion → endorsement and
-   claimant → prior-claim relationships so multi-hop questions ("excluded given
-   endorsement X *and* prior claim Y?") are answered by traversal, not proximity.
+   claimant → prior-claim relationships so multi-hop questions (“excluded given
+   endorsement X *and* prior claim Y?”) are answered by traversal, not proximity.
 4. **Evaluation** — build a small gold set of correct determinations and score
    faithfulness + answer-relevance with RAGAS before changing prompts.
 
