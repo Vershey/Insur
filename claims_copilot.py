@@ -45,19 +45,14 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 
 # --------------------------------------------------------------------------- #
-# Config — models are configurable via env vars. These are current API strings.
+# Config
 # --------------------------------------------------------------------------- #
 REASONING_MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4-6")
 RERANK_MODEL = os.environ.get("COPILOT_RERANK_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOKENS = 1200
-TOP_K_RETRIEVE = 6   # candidates after hybrid retrieval
-TOP_N_EVIDENCE = 4   # docs kept after rerank and passed to the drafter
+TOP_K_RETRIEVE = 6
+TOP_N_EVIDENCE = 4
 
-# --------------------------------------------------------------------------- #
-# Synthetic insurance corpus.
-# In production these chunks come from your policy admin system, claims DB,
-# and guideline store. NEVER load real customer PII/PHI into a demo.
-# --------------------------------------------------------------------------- #
 CORPUS: list[dict] = [
     {
         "id": "POL-BASE",
@@ -147,9 +142,6 @@ DEFAULT_CLAIM = (
 )
 
 
-# --------------------------------------------------------------------------- #
-# Hybrid retriever: BM25 + TF-IDF, fused with Reciprocal Rank Fusion.
-# --------------------------------------------------------------------------- #
 def _tok(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
@@ -201,9 +193,6 @@ class HybridRetriever:
         return [self.corpus[di] for di in top]
 
 
-# --------------------------------------------------------------------------- #
-# Real-time tools (STUBBED).
-# --------------------------------------------------------------------------- #
 def tool_weather_cat(date: str, location: str) -> dict:
     return {
         "tool": "weather_cat",
@@ -222,9 +211,6 @@ def tool_sanctions_screen(name: str) -> dict:
 TOOLS = {"weather_cat": tool_weather_cat, "sanctions_screen": tool_sanctions_screen}
 
 
-# --------------------------------------------------------------------------- #
-# Prompt templates.
-# --------------------------------------------------------------------------- #
 PLANNER_SYSTEM = """You are the retrieval planner for an insurance claims copilot.
 Given a claim (FNOL), decide what to retrieve and which real-time tools to call.
 Available tools: "weather_cat" (weather/catastrophe by date+location),
@@ -244,32 +230,33 @@ Respond with ONLY JSON: {"ranked_ids": ["ID", "ID", ...]}"""
 DRAFTER_SYSTEM = """You are an insurance coverage analyst drafting a FIRST-DRAFT
 coverage determination for a human adjuster to review. Use ONLY the supplied
 evidence and tool results. Every point in the rationale must trace to a cited
-doc_id. If the cause of loss is not established by the evidence, say so and
-prefer PARTIAL or flag it as an open question rather than guessing.
+doc_id. Use PENDING when the proximate cause or a required fact is unconfirmed
+and a decision cannot yet be made; prefer PARTIAL when partial coverage clearly
+applies but open questions remain; use COVERED or DENIED only when the evidence
+is conclusive.
 Respond with ONLY JSON in this schema:
 {
-  "decision": "COVERED | PARTIAL | DENIED",
+  "decision": "COVERED | PARTIAL | DENIED | PENDING",
   "rationale": "2-4 sentences, each grounded in a cited doc_id",
   "citations": [{"doc_id": "ID", "point": "what this doc establishes"}],
-  "open_questions": ["facts an adjuster must still confirm"]
+  "open_questions": ["facts an adjuster must still confirm before a final decision"]
 }"""
 
 VERIFIER_SYSTEM = """You are a faithfulness verifier. Check the draft determination
 against the evidence. Confirm every cited point is actually supported by the
 referenced doc. If any material point is unsupported, set all_supported=false and
-set final_decision to "ABSTAIN" (escalate to a human).
+set final_decision to "ABSTAIN" (escalate to a human). If the draft decision is
+PENDING, preserve it as PENDING unless the evidence clearly supports a stronger
+decision.
 Respond with ONLY JSON:
 {
   "all_supported": true,
   "unsupported_points": [],
-  "final_decision": "COVERED | PARTIAL | DENIED | ABSTAIN",
+  "final_decision": "COVERED | PARTIAL | DENIED | PENDING | ABSTAIN",
   "notes": "one or two sentences"
 }"""
 
 
-# --------------------------------------------------------------------------- #
-# LLM client wrapper.
-# --------------------------------------------------------------------------- #
 _MOCKS = {
     "plan": json.dumps({
         "queries": [
@@ -285,31 +272,33 @@ _MOCKS = {
         "ranked_ids": ["END-HO217", "END-HO305", "POL-BASE", "GUIDE-WTR", "CLM-2201", "DEF-FLOOD"]
     }),
     "draft": json.dumps({
-        "decision": "PARTIAL",
+        "decision": "PENDING",
         "rationale": (
             "The base policy covers sudden and accidental water discharge (POL-BASE), "
-            "but endorsement HO-217 excludes loss from flood or surface water (END-HO217), "
-            "and the weather feed shows a flood event on the loss date. If the intrusion "
-            "instead came from a sewer/drain backup, HO-305 provides up to a $5,000 sublimit "
-            "(END-HO305). Because the proximate cause is unconfirmed, coverage is partial "
-            "pending cause determination, consistent with the water-loss guideline (GUIDE-WTR)."
+            "but endorsement HO-217 excludes flood and surface water (END-HO217). "
+            "The weather feed confirms a flash-flood warning was active on the loss date, "
+            "raising the possibility of a surface-water exclusion; however, if the intrusion "
+            "came through a sewer or drain, HO-305 provides up to $5,000 of backup coverage "
+            "(END-HO305). Because the proximate cause has not been confirmed by field "
+            "investigation, a final determination cannot be issued at this time (GUIDE-WTR)."
         ),
         "citations": [
             {"doc_id": "POL-BASE", "point": "Covers sudden and accidental water discharge"},
             {"doc_id": "END-HO217", "point": "Excludes flood and surface water"},
             {"doc_id": "END-HO305", "point": "Adds water-backup coverage up to $5,000"},
-            {"doc_id": "GUIDE-WTR", "point": "Confirm proximate cause and pull weather data"},
+            {"doc_id": "GUIDE-WTR", "point": "Proximate cause must be confirmed before coverage is decided"},
         ],
         "open_questions": [
             "Was the intrusion surface water (excluded) or a drain/sewer backup (covered to $5,000)?",
             "Is there evidence of the entry path (foundation crack vs. floor drain)?",
+            "Has a field adjuster inspected the entry point and drainage system?",
         ],
     }),
     "verify": json.dumps({
         "all_supported": True,
         "unsupported_points": [],
-        "final_decision": "PARTIAL",
-        "notes": "All cited points trace to the referenced documents; cause of loss remains an open question for the adjuster.",
+        "final_decision": "PENDING",
+        "notes": "All cited points trace to the referenced documents; proximate cause is unconfirmed so PENDING is the appropriate status until field investigation is complete.",
     }),
 }
 
@@ -348,7 +337,7 @@ def parse_json(s: str) -> dict:
 # Confidence score: 0 (low) → 100 (high).
 # --------------------------------------------------------------------------- #
 def confidence_score(draft: dict, verify: dict) -> int:
-    base = {"COVERED": 85, "PARTIAL": 55, "DENIED": 70, "ABSTAIN": 15}.get(
+    base = {"COVERED": 85, "PARTIAL": 55, "DENIED": 70, "PENDING": 35, "ABSTAIN": 15}.get(
         verify.get("final_decision", "ABSTAIN"), 15
     )
     if not verify.get("all_supported", False):
@@ -371,9 +360,6 @@ def render_confidence_bar(score: int, width: int = 40) -> str:
     return f"  [{bar}] {score:3d}/100  ({label})"
 
 
-# --------------------------------------------------------------------------- #
-# The agentic pipeline.
-# --------------------------------------------------------------------------- #
 def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     line = lambda c="-": print(c * 78)
 
