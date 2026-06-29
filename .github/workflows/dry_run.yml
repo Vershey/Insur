@@ -1,0 +1,83 @@
+name: Claims Copilot — Dry Run
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  dry-run:
+    name: Run pipeline (offline)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install rank-bm25 numpy
+
+      - name: Run dry-run and capture output
+        id: copilot
+        run: |
+          python claims_copilot.py --dry-run | tee /tmp/output.txt
+          # Extract confidence score line
+          SCORE=$(grep -oP '\d+(?=/100)' /tmp/output.txt | tail -1)
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        run: |
+          SCORE="${{ steps.copilot.outputs.score }}"
+
+          # Determine label and colour
+          if   [ "$SCORE" -ge 70 ]; then LABEL="HIGH";   COLOR="#2ea44f"; BG="#d1f0db";
+          elif [ "$SCORE" -ge 40 ]; then LABEL="MEDIUM"; COLOR="#b58900"; BG="#fff3cd";
+          else                           LABEL="LOW";    COLOR="#d73a49"; BG="#ffdce0";
+          fi
+
+          # Build filled/empty segments (40 cells wide)
+          FILLED=$(( SCORE * 40 / 100 ))
+          EMPTY=$(( 40 - FILLED ))
+          BAR_FILLED=$(printf '█%.0s' $(seq 1 $FILLED) 2>/dev/null || true)
+          BAR_EMPTY=$(printf '░%.0s'  $(seq 1 $EMPTY)  2>/dev/null || true)
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## Claims Coverage Copilot — Confidence Score
+
+          <table>
+          <tr>
+            <td><strong>Score</strong></td>
+            <td>
+              <span style="font-size:1.4em;font-weight:bold;color:${COLOR}">${SCORE}/100</span>
+              &nbsp;
+              <span style="background:${BG};color:${COLOR};padding:2px 10px;border-radius:12px;font-weight:600;">${LABEL}</span>
+            </td>
+          </tr>
+          <tr>
+            <td colspan="2">
+              <div style="background:#e0e0e0;border-radius:6px;height:22px;width:100%;max-width:480px;">
+                <div style="background:${COLOR};border-radius:6px;height:22px;width:${SCORE}%;"></div>
+              </div>
+            </td>
+          </tr>
+          </table>
+
+          ```
+          0                                              100
+          [${BAR_FILLED}${BAR_EMPTY}] ${SCORE}/100  (${LABEL})
+          LOW                                           HIGH
+          ```
+
+          <details>
+          <summary>Full pipeline output</summary>
+
+          \`\`\`
+          $(cat /tmp/output.txt)
+          \`\`\`
+
+          </details>
+          SUMMARY

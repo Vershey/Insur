@@ -64,8 +64,12 @@ All live near the top of `claims_copilot.py` and are easy to tune:
   faithfulness check, displayed as an ASCII bar (0 = LOW → 100 = HIGH).
 
 ## Confidence score
-Step 7 of the pipeline prints a graphical bar after the verifier:
 
+Step 7 of the pipeline computes a 0–100 score and renders it as a bar — in the
+terminal **and** in the GitHub Actions job summary (see the **Actions** tab after
+any push).
+
+**Terminal output**
 ```
 7) CONFIDENCE SCORE
 ------------------------------------------------------------------------------
@@ -74,12 +78,28 @@ Step 7 of the pipeline prints a graphical bar after the verifier:
    LOW                                    HIGH
 ```
 
-The score is computed from:
-- **Base** — decision type: COVERED → 85, DENIED → 70, PARTIAL → 55, ABSTAIN → 15
-- **Faithfulness penalty** — −30 if `all_supported` is false
-- **Open-question penalty** — −8 per unresolved adjuster question (capped at −24)
+**GitHub Actions job summary** — the workflow renders an HTML progress bar with
+colour coding that is visible directly on GitHub without opening logs:
 
-It is also returned in the `run()` dict as `"confidence_score"` for downstream use.
+| Threshold | Label | Colour |
+|-----------|-------|--------|
+| ≥ 70 | **HIGH** | 🟢 green |
+| 40 – 69 | **MEDIUM** | 🟡 yellow |
+| < 40 | **LOW** | 🔴 red |
+
+**Scoring formula**
+
+| Factor | Effect |
+|--------|--------|
+| Decision = COVERED | base 85 |
+| Decision = DENIED | base 70 |
+| Decision = PARTIAL | base 55 |
+| Decision = ABSTAIN | base 15 |
+| `all_supported` is false | − 30 |
+| Each open question | − 8 (max − 24) |
+
+The score is also returned in the `run()` dict as `"confidence_score"` for
+downstream use.
 
 ## Where to extend (in order of payoff)
 1. **Real embeddings** — add an `EmbeddingRetriever` (Voyage, OpenAI, or a local
