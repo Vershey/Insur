@@ -43,9 +43,37 @@ setx   ANTHROPIC_API_KEY "sk-ant-..."     # Windows (open a new shell after)
 python claims_copilot.py                                  # default sample claim
 python claims_copilot.py --claim "FNOL: ... your claim ..."
 python claims_copilot.py --model claude-opus-4-8          # heavier reasoning
+python claims_copilot.py --embedder hashing               # + dense semantic retrieval (no key needed)
 ```
 The SDK reads `ANTHROPIC_API_KEY` automatically. Models are configurable via
 `COPILOT_MODEL` and `COPILOT_RERANK_MODEL`.
+
+### Dense (semantic) retrieval — `--embedder`
+
+`HybridRetriever` always fuses BM25 + TF-IDF via Reciprocal Rank Fusion. Pass
+`--embedder` to fuse in a third, *semantic* ranked list from dense embeddings:
+
+| `--embedder` | Backend | Needs |
+|---|---|---|
+| `none` (default) | lexical only | nothing |
+| `hashing` | deterministic hashing-trick vectors | nothing (offline-safe stand-in) |
+| `voyage` | Voyage AI | `pip install voyageai`, `VOYAGE_API_KEY` |
+| `openai` | OpenAI embeddings | `pip install openai`, `OPENAI_API_KEY` |
+| `st` | local sentence-transformers model | `pip install sentence-transformers` |
+
+Also configurable via `COPILOT_EMBEDDER`.
+
+## Prompt evaluation harness
+
+`eval_prompts.py` runs a small gold set of claims through the pipeline and
+scores decision accuracy, retrieval recall, citation grounding, and abstain
+correctness — and can A/B compare prompt variants.
+```bash
+python eval_prompts.py                    # offline, proves the harness + scorers work
+python eval_prompts.py --live              # real API — where prompt edits actually move the numbers
+python eval_prompts.py --live --compare    # run every variant in VARIANTS and compare
+python eval_prompts.py --live --judge      # add an LLM-as-judge faithfulness score
+```
 
 ## The four prompts (this is the product)
 All live near the top of `claims_copilot.py` and are easy to tune:
@@ -117,8 +145,9 @@ The score is also returned in the `run()` dict as `"confidence_score"` for
 downstream use.
 
 ## Where to extend (in order of payoff)
-1. **Real embeddings** — add an `EmbeddingRetriever` (Voyage, OpenAI, or a local
-   sentence-transformer) as a third ranked list and fuse it in `HybridRetriever`.
+1. ~~**Real embeddings**~~ — done: `--embedder {hashing,voyage,openai,st}` fuses a
+   third, semantic ranked list into `HybridRetriever` via RRF. See
+   [Dense (semantic) retrieval](#dense-semantic-retrieval---embedder) above.
 2. **Real-time feeds** — replace the tool stubs with live calls (e.g. National
    Weather Service for CAT, the public OFAC SDN list for screening). Your runtime
    must allow network egress to those domains.

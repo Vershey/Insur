@@ -155,16 +155,18 @@ def _tok(text: str) -> list[str]:
 
 
 class HybridRetriever:
-    """Lexical hybrid (BM25 + TF-IDF) with RRF fusion.
+    """Hybrid retrieval with Reciprocal Rank Fusion.
 
-    This runs anywhere with no API key or network. To make it a true
-    lexical+semantic hybrid, add an EmbeddingRetriever (Voyage / OpenAI /
-    sentence-transformers) as a third ranked list and fuse it in below.
+    Always fuses BM25 + TF-IDF (both run anywhere, no key or network). If an
+    `embedder` is supplied, a third *semantic* ranked list from dense
+    embeddings is fused in as well — the full lexical+semantic hybrid.
+    Pass embedder=None for lexical-only behaviour (backward compatible).
     """
 
-    def __init__(self, corpus: list[dict]):
+    def __init__(self, corpus: list[dict], embedder=None):
         self.corpus = corpus
         self.ids = [d["id"] for d in corpus]
+        self.embedder = embedder
         toks = [_tok(d["text"] + " " + d["source"]) for d in corpus]
         self.bm25 = BM25Okapi(toks)
         # --- tiny TF-IDF in numpy (no sklearn needed) ---
@@ -180,6 +182,10 @@ class HybridRetriever:
         mat = tf * self.idf
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         self.doc_vecs = mat / np.clip(norms, 1e-9, None)
+        # --- optional dense embeddings: the third (semantic) ranked list ---
+        self.doc_emb = None
+        if embedder is not None:
+            self.doc_emb = np.asarray(embedder([d["text"] + " " + d["source"] for d in corpus]))
 
     def _tfidf_query_vec(self, query: str) -> np.ndarray:
         v = np.zeros(len(self.vocab))
@@ -197,14 +203,95 @@ class HybridRetriever:
 
     def search(self, queries: list[str], top_k: int = TOP_K_RETRIEVE) -> list[dict]:
         rrf, k = {}, 60  # standard RRF constant
-        for q in queries:
-            bm_ranks = self._ranks(np.array(self.bm25.get_scores(_tok(q))))
-            tf_ranks = self._ranks(self.doc_vecs @ self._tfidf_query_vec(q))
-            for ranks in (bm_ranks, tf_ranks):
+        # embed all queries in one batch if a dense retriever is configured
+        q_emb = np.asarray(self.embedder(queries)) if self.embedder is not None else None
+        for qi, q in enumerate(queries):
+            ranklists = [
+                self._ranks(np.array(self.bm25.get_scores(_tok(q)))),    # BM25 (lexical)
+                self._ranks(self.doc_vecs @ self._tfidf_query_vec(q)),   # TF-IDF (lexical)
+            ]
+            if q_emb is not None:
+                ranklists.append(self._ranks(self.doc_emb @ q_emb[qi]))  # dense (semantic)
+            for ranks in ranklists:
                 for di, r in ranks.items():
                     rrf[di] = rrf.get(di, 0.0) + 1.0 / (k + r)
         top = sorted(rrf, key=lambda di: -rrf[di])[:top_k]
         return [self.corpus[di] for di in top]
+
+
+# --------------------------------------------------------------------------- #
+# Embedding backends for the dense (semantic) ranked list. Each factory
+# returns an `embed(texts: list[str]) -> np.ndarray` function. Swap in any of
+# these via the --embedder CLI flag; "hashing" needs no key/network.
+# --------------------------------------------------------------------------- #
+def hashing_embedder(dim: int = 512):
+    """Zero-dependency deterministic embedding (hashing trick over word + 3-gram
+    features). Not learned/semantic — a stand-in so the hybrid runs with no model
+    download or API call. Swap in Voyage/OpenAI/ST for real semantics."""
+    import hashlib
+
+    def _features(text: str) -> list[str]:
+        toks = _tok(text)
+        return toks + [t[i:i + 3] for t in toks for i in range(max(1, len(t) - 2))]
+
+    def embed(texts):
+        texts = list(texts)
+        vecs = np.zeros((len(texts), dim))
+        for row, t in enumerate(texts):
+            for f in _features(t):
+                h = int(hashlib.md5(f.encode()).hexdigest(), 16)
+                vecs[row, h % dim] += 1.0 if (h >> 1) & 1 else -1.0
+        return vecs / np.clip(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def voyage_embedder(model: str = "voyage-3"):
+    """Real semantic embeddings via Voyage AI. `pip install voyageai`, set VOYAGE_API_KEY."""
+    import voyageai
+    client = voyageai.Client()  # reads VOYAGE_API_KEY
+
+    def embed(texts):
+        out = client.embed(list(texts), model=model, input_type="document").embeddings
+        v = np.asarray(out, dtype=float)
+        return v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def openai_embedder(model: str = "text-embedding-3-small"):
+    """Real semantic embeddings via OpenAI. `pip install openai`, set OPENAI_API_KEY."""
+    from openai import OpenAI
+    client = OpenAI()  # reads OPENAI_API_KEY
+
+    def embed(texts):
+        data = client.embeddings.create(model=model, input=list(texts)).data
+        v = np.asarray([d.embedding for d in data], dtype=float)
+        return v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def sentence_transformer_embedder(model: str = "all-MiniLM-L6-v2"):
+    """Local semantic embeddings. `pip install sentence-transformers`
+    (downloads the model on first run)."""
+    from sentence_transformers import SentenceTransformer
+    st = SentenceTransformer(model)
+
+    def embed(texts):
+        return np.asarray(st.encode(list(texts), normalize_embeddings=True), dtype=float)
+
+    return embed
+
+
+# Registry used by the CLI --embedder flag. Values are factories returning embed fns.
+EMBEDDERS = {
+    "none": lambda: None,
+    "hashing": hashing_embedder,
+    "voyage": voyage_embedder,
+    "openai": openai_embedder,
+    "st": sentence_transformer_embedder,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +421,7 @@ _MOCKS = {
 @dataclass
 class LLM:
     dry_run: bool = False
+    mock_fn: object = field(default=None, repr=False)  # eval harness injects case-aware offline replies
     client: object = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -343,7 +431,7 @@ class LLM:
 
     def complete(self, *, step: str, system: str, user: str, model: str) -> str:
         if self.dry_run:
-            return _MOCKS[step]
+            return self.mock_fn(step=step, system=system, user=user) if self.mock_fn else _MOCKS[step]
         resp = self.client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
@@ -483,6 +571,9 @@ def main() -> None:
                     help="run offline with canned LLM responses (no API key needed)")
     ap.add_argument("--claim", default=DEFAULT_CLAIM, help="FNOL / claim text")
     ap.add_argument("--model", default=REASONING_MODEL, help="reasoning model id")
+    ap.add_argument("--embedder", default=os.environ.get("COPILOT_EMBEDDER", "none"),
+                    choices=list(EMBEDDERS),
+                    help="dense retriever fused into hybrid search (none = lexical only)")
     args = ap.parse_args()
 
     if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -494,12 +585,19 @@ def main() -> None:
 
     REASONING_MODEL = args.model
     mode = "DRY-RUN (offline, canned LLM)" if args.dry_run else f"LIVE API ({REASONING_MODEL})"
+    retrieval = "BM25 + TF-IDF" + ("" if args.embedder == "none" else f" + {args.embedder} embeddings")
     print("=" * 78)
     print(f"CLAIMS COVERAGE COPILOT  —  mode: {mode}")
+    print(f"retrieval: {retrieval}")
     print("=" * 78)
     print("CLAIM:\n  " + args.claim.replace("\n", "\n  ") + "\n")
 
-    retriever = HybridRetriever(CORPUS)
+    try:
+        embedder = EMBEDDERS[args.embedder]()
+    except Exception as e:
+        raise SystemExit(f"Could not initialise '{args.embedder}' embedder: {e}\n"
+                         "Install its library and set its key, or use --embedder hashing/none.")
+    retriever = HybridRetriever(CORPUS, embedder=embedder)
     llm = LLM(dry_run=args.dry_run)
     run(args.claim, retriever, llm)
 
