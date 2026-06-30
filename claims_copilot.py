@@ -45,14 +45,19 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 
 # --------------------------------------------------------------------------- #
-# Config
+# Config — models are configurable via env vars. These are current API strings.
 # --------------------------------------------------------------------------- #
 REASONING_MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4-6")
 RERANK_MODEL = os.environ.get("COPILOT_RERANK_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOKENS = 1200
-TOP_K_RETRIEVE = 6
-TOP_N_EVIDENCE = 4
+TOP_K_RETRIEVE = 6   # candidates after hybrid retrieval
+TOP_N_EVIDENCE = 4   # docs kept after rerank and passed to the drafter
 
+# --------------------------------------------------------------------------- #
+# Synthetic insurance corpus.
+# In production these chunks come from your policy admin system, claims DB,
+# and guideline store. NEVER load real customer PII/PHI into a demo.
+# --------------------------------------------------------------------------- #
 CORPUS: list[dict] = [
     {
         "id": "POL-BASE",
@@ -142,18 +147,29 @@ DEFAULT_CLAIM = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# Hybrid retriever: BM25 + TF-IDF, fused with Reciprocal Rank Fusion.
+# --------------------------------------------------------------------------- #
 def _tok(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
 class HybridRetriever:
-    """Lexical hybrid (BM25 + TF-IDF) with RRF fusion."""
+    """Hybrid retrieval with Reciprocal Rank Fusion.
 
-    def __init__(self, corpus: list[dict]):
+    Always fuses BM25 + TF-IDF (both run anywhere, no key or network). If an
+    `embedder` is supplied, a third *semantic* ranked list from dense
+    embeddings is fused in as well — the full lexical+semantic hybrid.
+    Pass embedder=None for lexical-only behaviour (backward compatible).
+    """
+
+    def __init__(self, corpus: list[dict], embedder=None):
         self.corpus = corpus
         self.ids = [d["id"] for d in corpus]
+        self.embedder = embedder
         toks = [_tok(d["text"] + " " + d["source"]) for d in corpus]
         self.bm25 = BM25Okapi(toks)
+        # --- tiny TF-IDF in numpy (no sklearn needed) ---
         self.vocab = sorted({t for doc in toks for t in doc})
         self.vindex = {t: i for i, t in enumerate(self.vocab)}
         n_docs, n_vocab = len(corpus), len(self.vocab)
@@ -166,6 +182,10 @@ class HybridRetriever:
         mat = tf * self.idf
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         self.doc_vecs = mat / np.clip(norms, 1e-9, None)
+        # --- optional dense embeddings: the third (semantic) ranked list ---
+        self.doc_emb = None
+        if embedder is not None:
+            self.doc_emb = np.asarray(embedder([d["text"] + " " + d["source"] for d in corpus]))
 
     def _tfidf_query_vec(self, query: str) -> np.ndarray:
         v = np.zeros(len(self.vocab))
@@ -182,18 +202,104 @@ class HybridRetriever:
         return {int(idx): rank for rank, idx in enumerate(order)}
 
     def search(self, queries: list[str], top_k: int = TOP_K_RETRIEVE) -> list[dict]:
-        rrf, k = {}, 60
-        for q in queries:
-            bm_ranks = self._ranks(np.array(self.bm25.get_scores(_tok(q))))
-            tf_ranks = self._ranks(self.doc_vecs @ self._tfidf_query_vec(q))
-            for ranks in (bm_ranks, tf_ranks):
+        rrf, k = {}, 60  # standard RRF constant
+        # embed all queries in one batch if a dense retriever is configured
+        q_emb = np.asarray(self.embedder(queries)) if self.embedder is not None else None
+        for qi, q in enumerate(queries):
+            ranklists = [
+                self._ranks(np.array(self.bm25.get_scores(_tok(q)))),    # BM25 (lexical)
+                self._ranks(self.doc_vecs @ self._tfidf_query_vec(q)),   # TF-IDF (lexical)
+            ]
+            if q_emb is not None:
+                ranklists.append(self._ranks(self.doc_emb @ q_emb[qi]))  # dense (semantic)
+            for ranks in ranklists:
                 for di, r in ranks.items():
                     rrf[di] = rrf.get(di, 0.0) + 1.0 / (k + r)
         top = sorted(rrf, key=lambda di: -rrf[di])[:top_k]
         return [self.corpus[di] for di in top]
 
 
+# --------------------------------------------------------------------------- #
+# Embedding backends for the dense (semantic) ranked list. Each factory
+# returns an `embed(texts: list[str]) -> np.ndarray` function. Swap in any of
+# these via the --embedder CLI flag; "hashing" needs no key/network.
+# --------------------------------------------------------------------------- #
+def hashing_embedder(dim: int = 512):
+    """Zero-dependency deterministic embedding (hashing trick over word + 3-gram
+    features). Not learned/semantic — a stand-in so the hybrid runs with no model
+    download or API call. Swap in Voyage/OpenAI/ST for real semantics."""
+    import hashlib
+
+    def _features(text: str) -> list[str]:
+        toks = _tok(text)
+        return toks + [t[i:i + 3] for t in toks for i in range(max(1, len(t) - 2))]
+
+    def embed(texts):
+        texts = list(texts)
+        vecs = np.zeros((len(texts), dim))
+        for row, t in enumerate(texts):
+            for f in _features(t):
+                h = int(hashlib.md5(f.encode()).hexdigest(), 16)
+                vecs[row, h % dim] += 1.0 if (h >> 1) & 1 else -1.0
+        return vecs / np.clip(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def voyage_embedder(model: str = "voyage-3"):
+    """Real semantic embeddings via Voyage AI. `pip install voyageai`, set VOYAGE_API_KEY."""
+    import voyageai
+    client = voyageai.Client()  # reads VOYAGE_API_KEY
+
+    def embed(texts):
+        out = client.embed(list(texts), model=model, input_type="document").embeddings
+        v = np.asarray(out, dtype=float)
+        return v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def openai_embedder(model: str = "text-embedding-3-small"):
+    """Real semantic embeddings via OpenAI. `pip install openai`, set OPENAI_API_KEY."""
+    from openai import OpenAI
+    client = OpenAI()  # reads OPENAI_API_KEY
+
+    def embed(texts):
+        data = client.embeddings.create(model=model, input=list(texts)).data
+        v = np.asarray([d.embedding for d in data], dtype=float)
+        return v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-9, None)
+
+    return embed
+
+
+def sentence_transformer_embedder(model: str = "all-MiniLM-L6-v2"):
+    """Local semantic embeddings. `pip install sentence-transformers`
+    (downloads the model on first run)."""
+    from sentence_transformers import SentenceTransformer
+    st = SentenceTransformer(model)
+
+    def embed(texts):
+        return np.asarray(st.encode(list(texts), normalize_embeddings=True), dtype=float)
+
+    return embed
+
+
+# Registry used by the CLI --embedder flag. Values are factories returning embed fns.
+EMBEDDERS = {
+    "none": lambda: None,
+    "hashing": hashing_embedder,
+    "voyage": voyage_embedder,
+    "openai": openai_embedder,
+    "st": sentence_transformer_embedder,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Real-time tools (STUBBED). Swap the bodies for live API calls.
+# The container/network must allow egress to the provider's domain.
+# --------------------------------------------------------------------------- #
 def tool_weather_cat(date: str, location: str) -> dict:
+    # TODO: replace with a live call, e.g. National Weather Service / NOAA.
     return {
         "tool": "weather_cat",
         "date": date,
@@ -205,12 +311,17 @@ def tool_weather_cat(date: str, location: str) -> dict:
 
 
 def tool_sanctions_screen(name: str) -> dict:
+    # TODO: replace with a live screen against the public OFAC SDN list.
     return {"tool": "sanctions_screen", "name": name, "match": False, "list": "OFAC SDN (stubbed)"}
 
 
 TOOLS = {"weather_cat": tool_weather_cat, "sanctions_screen": tool_sanctions_screen}
 
 
+# --------------------------------------------------------------------------- #
+# Prompt templates. System prompts are constants; user prompts are built from
+# data at call time. These four prompts ARE the product — tune them here.
+# --------------------------------------------------------------------------- #
 PLANNER_SYSTEM = """You are the retrieval planner for an insurance claims copilot.
 Given a claim (FNOL), decide what to retrieve and which real-time tools to call.
 Available tools: "weather_cat" (weather/catastrophe by date+location),
@@ -257,6 +368,10 @@ Respond with ONLY JSON:
 }"""
 
 
+# --------------------------------------------------------------------------- #
+# LLM client wrapper. dry_run returns canned JSON so the whole pipeline runs
+# with no key; real mode calls the Anthropic Messages API.
+# --------------------------------------------------------------------------- #
 _MOCKS = {
     "plan": json.dumps({
         "queries": [
@@ -306,16 +421,17 @@ _MOCKS = {
 @dataclass
 class LLM:
     dry_run: bool = False
+    mock_fn: object = field(default=None, repr=False)  # eval harness injects case-aware offline replies
     client: object = field(default=None, repr=False)
 
     def __post_init__(self):
         if not self.dry_run:
-            import anthropic
-            self.client = anthropic.Anthropic()
+            import anthropic  # imported lazily so dry-run needs nothing
+            self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
     def complete(self, *, step: str, system: str, user: str, model: str) -> str:
         if self.dry_run:
-            return _MOCKS[step]
+            return self.mock_fn(step=step, system=system, user=user) if self.mock_fn else _MOCKS[step]
         resp = self.client.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
@@ -335,6 +451,7 @@ def parse_json(s: str) -> dict:
 
 # --------------------------------------------------------------------------- #
 # Confidence score: 0 (low) → 100 (high).
+# Derived from the verifier's final decision and faithfulness check.
 # --------------------------------------------------------------------------- #
 def confidence_score(draft: dict, verify: dict) -> int:
     base = {"COVERED": 85, "PARTIAL": 55, "DENIED": 70, "PENDING": 35, "ABSTAIN": 15}.get(
@@ -360,9 +477,13 @@ def render_confidence_bar(score: int, width: int = 40) -> str:
     return f"  [{bar}] {score:3d}/100  ({label})"
 
 
+# --------------------------------------------------------------------------- #
+# The agentic pipeline.
+# --------------------------------------------------------------------------- #
 def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     line = lambda c="-": print(c * 78)
 
+    # 1. PLAN
     plan = parse_json(llm.complete(
         step="plan", system=PLANNER_SYSTEM, model=REASONING_MODEL,
         user=f"<claim>\n{claim}\n</claim>",
@@ -371,11 +492,13 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     print("   queries:", plan["queries"])
     print("   tools  :", plan.get("tools", []))
 
+    # 2. RETRIEVE (hybrid BM25 + TF-IDF + RRF)
     candidates = retriever.search(plan["queries"])
     print("\n2) RETRIEVE (hybrid + RRF)"); line()
     for d in candidates:
         print(f"   [{d['id']:<9}] {d['source']}")
 
+    # 3. RERANK (LLM)
     cand_block = "\n".join(f"[{d['id']}] {d['text']}" for d in candidates)
     rr = parse_json(llm.complete(
         step="rerank", system=RERANK_SYSTEM, model=RERANK_MODEL,
@@ -383,10 +506,11 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     ))
     cand_ids = {d["id"] for d in candidates}
     ordered = [i for i in rr.get("ranked_ids", []) if i in cand_ids]
-    ordered += [i for i in cand_ids if i not in ordered]
+    ordered += [i for i in cand_ids if i not in ordered]      # robustness
     evidence = [ID_TO_DOC[i] for i in ordered[:TOP_N_EVIDENCE]]
     print("\n3) RERANK -> evidence kept:", [d["id"] for d in evidence])
 
+    # 4. REAL-TIME TOOLS
     realtime = {}
     print("\n4) REAL-TIME TOOLS"); line()
     for name in plan.get("tools", []):
@@ -396,6 +520,7 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
             realtime[name] = TOOLS[name]("John Roe")
         print(f"   {name}: {realtime[name]}")
 
+    # 5. DRAFT determination (LLM, grounded + cited)
     ev_block = "\n".join(f"[{d['id']}] ({d['source']}) {d['text']}" for d in evidence)
     draft = parse_json(llm.complete(
         step="draft", system=DRAFTER_SYSTEM, model=REASONING_MODEL,
@@ -403,11 +528,13 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
               f"<realtime>\n{json.dumps(realtime)}\n</realtime>"),
     ))
 
+    # 6. VERIFY (faithfulness gate -> abstain if unsupported)
     verify = parse_json(llm.complete(
         step="verify", system=VERIFIER_SYSTEM, model=REASONING_MODEL,
         user=(f"<draft>\n{json.dumps(draft)}\n</draft>\n<evidence>\n{ev_block}\n</evidence>"),
     ))
 
+    # ---- report ----
     print("\n5) DRAFT DETERMINATION"); line()
     print("   decision :", draft["decision"])
     print("   rationale:", draft["rationale"])
@@ -423,6 +550,7 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     print("   FINAL DECISION:", verify["final_decision"])
     print("   notes         :", verify["notes"])
 
+    # 7. CONFIDENCE SCORE
     score = confidence_score(draft, verify)
     print("\n7) CONFIDENCE SCORE"); line()
     print(render_confidence_bar(score))
@@ -443,6 +571,9 @@ def main() -> None:
                     help="run offline with canned LLM responses (no API key needed)")
     ap.add_argument("--claim", default=DEFAULT_CLAIM, help="FNOL / claim text")
     ap.add_argument("--model", default=REASONING_MODEL, help="reasoning model id")
+    ap.add_argument("--embedder", default=os.environ.get("COPILOT_EMBEDDER", "none"),
+                    choices=list(EMBEDDERS),
+                    help="dense retriever fused into hybrid search (none = lexical only)")
     args = ap.parse_args()
 
     if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -454,12 +585,19 @@ def main() -> None:
 
     REASONING_MODEL = args.model
     mode = "DRY-RUN (offline, canned LLM)" if args.dry_run else f"LIVE API ({REASONING_MODEL})"
+    retrieval = "BM25 + TF-IDF" + ("" if args.embedder == "none" else f" + {args.embedder} embeddings")
     print("=" * 78)
     print(f"CLAIMS COVERAGE COPILOT  —  mode: {mode}")
+    print(f"retrieval: {retrieval}")
     print("=" * 78)
     print("CLAIM:\n  " + args.claim.replace("\n", "\n  ") + "\n")
 
-    retriever = HybridRetriever(CORPUS)
+    try:
+        embedder = EMBEDDERS[args.embedder]()
+    except Exception as e:
+        raise SystemExit(f"Could not initialise '{args.embedder}' embedder: {e}\n"
+                         "Install its library and set its key, or use --embedder hashing/none.")
+    retriever = HybridRetriever(CORPUS, embedder=embedder)
     llm = LLM(dry_run=args.dry_run)
     run(args.claim, retriever, llm)
 
