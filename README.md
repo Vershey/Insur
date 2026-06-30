@@ -97,14 +97,18 @@ Step 7 of the pipeline computes a 0–100 score and renders it as a bar — in t
 terminal **and** in the GitHub Actions job summary (see the **Actions** tab after
 any push).
 
-**Terminal output — example for a PENDING claim (Austin water case)**
+**Terminal output — example for a COVERED claim (Austin water heater case)**
 ```
 7) CONFIDENCE SCORE
 ------------------------------------------------------------------------------
-  [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  11/100  (LOW   )
+  [██████████████████████████████████░░░░░░]  85/100  (HIGH  )
    0 ←──────────────────────────────────────→ 100
    LOW                                    HIGH
 ```
+
+> **COVERED** means the evidence conclusively supports coverage with no open
+> questions — here, a confirmed sudden/accidental appliance rupture with a
+> matching prior-claim precedent.
 
 > **PENDING** means the proximate cause is unconfirmed and no final determination
 > can be issued until a field adjuster investigates. It scores lower than PARTIAL
