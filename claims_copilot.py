@@ -140,10 +140,11 @@ CORPUS: list[dict] = [
 ID_TO_DOC = {d["id"]: d for d in CORPUS}
 
 DEFAULT_CLAIM = (
-    "FNOL: Homeowner reports water in the finished basement after heavy rain "
-    "on 2026-03-14 in Austin, TX. Standing water ~3 inches; damage to drywall "
-    "and personal property. Claimant: John Roe. Policy: HO-1002. Cause not yet "
-    "confirmed — possibly surface water, possibly a drain backup."
+    "FNOL: Homeowner reports the water heater tank ruptured suddenly on "
+    "2026-03-14 in Austin, TX, discharging water into the basement. Damage to "
+    "drywall and personal property. Claimant: John Roe. Policy: HO-1002. "
+    "Adjuster confirmed the rupture was sudden and accidental, not long-term "
+    "seepage."
 )
 
 
@@ -375,45 +376,37 @@ Respond with ONLY JSON:
 _MOCKS = {
     "plan": json.dumps({
         "queries": [
-            "sudden accidental water discharge coverage",
-            "flood surface water exclusion endorsement",
-            "water backup sewer drain sublimit",
+            "sudden accidental appliance water discharge coverage",
+            "water heater tank ruptured covered claim",
+            "dwelling personal property water damage",
             "basement water heavy rain prior claim",
         ],
         "tools": ["weather_cat", "sanctions_screen"],
-        "reasoning": "Water loss after heavy rain needs coverage, exclusions, backup add-on, and weather data.",
+        "reasoning": "Appliance rupture with a confirmed sudden, accidental cause is likely covered.",
     }),
     "rerank": json.dumps({
-        "ranked_ids": ["END-HO217", "END-HO305", "POL-BASE", "GUIDE-WTR", "CLM-2201", "DEF-FLOOD"]
+        "ranked_ids": ["POL-BASE", "CLM-2202", "GUIDE-WTR", "END-HO305", "END-HO217", "DEF-FLOOD"]
     }),
     "draft": json.dumps({
-        "decision": "PENDING",
+        "decision": "COVERED",
         "rationale": (
-            "The base policy covers sudden and accidental water discharge (POL-BASE), "
-            "but endorsement HO-217 excludes flood and surface water (END-HO217). "
-            "The weather feed confirms a flash-flood warning was active on the loss date, "
-            "raising the possibility of a surface-water exclusion; however, if the intrusion "
-            "came through a sewer or drain, HO-305 provides up to $5,000 of backup coverage "
-            "(END-HO305). Because the proximate cause has not been confirmed by field "
-            "investigation, a final determination cannot be issued at this time (GUIDE-WTR)."
+            "A water heater tank rupture is sudden and accidental discharge from a "
+            "household appliance, which the base policy covers (POL-BASE). A prior "
+            "claim with the same fact pattern was covered on the same basis "
+            "(CLM-2202). The adjuster has confirmed the rupture was sudden and "
+            "accidental, not long-term seepage, so no exclusion applies."
         ),
         "citations": [
-            {"doc_id": "POL-BASE", "point": "Covers sudden and accidental water discharge"},
-            {"doc_id": "END-HO217", "point": "Excludes flood and surface water"},
-            {"doc_id": "END-HO305", "point": "Adds water-backup coverage up to $5,000"},
-            {"doc_id": "GUIDE-WTR", "point": "Proximate cause must be confirmed before coverage is decided"},
+            {"doc_id": "POL-BASE", "point": "Covers sudden and accidental discharge from a household appliance"},
+            {"doc_id": "CLM-2202", "point": "Prior water-heater rupture with the same facts was covered"},
         ],
-        "open_questions": [
-            "Was the intrusion surface water (excluded) or a drain/sewer backup (covered to $5,000)?",
-            "Is there evidence of the entry path (foundation crack vs. floor drain)?",
-            "Has a field adjuster inspected the entry point and drainage system?",
-        ],
+        "open_questions": [],
     }),
     "verify": json.dumps({
         "all_supported": True,
         "unsupported_points": [],
-        "final_decision": "PENDING",
-        "notes": "All cited points trace to the referenced documents; proximate cause is unconfirmed so PENDING is the appropriate status until field investigation is complete.",
+        "final_decision": "COVERED",
+        "notes": "Both citations trace to the referenced documents; the confirmed sudden/accidental cause supports coverage with no open questions.",
     }),
 }
 
