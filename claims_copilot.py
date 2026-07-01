@@ -20,6 +20,8 @@ Agentic pipeline (each step is a real piece of an advanced-RAG system):
     7. confidence -> 0–100 score derived from decision + faithfulness, shown
                     as an ASCII bar (0 = LOW, 100 = HIGH)
 
+Pass --live-tools to hit the real NWS + OFAC endpoints instead of stubs.
+
 Run it two ways
 ---------------
     # Fully offline, no key needed (canned LLM responses) -- proves the flow:
@@ -296,27 +298,141 @@ EMBEDDERS = {
 
 
 # --------------------------------------------------------------------------- #
-# Real-time tools (STUBBED). Swap the bodies for live API calls.
-# The container/network must allow egress to the provider's domain.
+# Real-time tools.
+# Two live sources, both free and key-less (but your runtime must allow egress):
+#   - weather/CAT : National Weather Service  https://api.weather.gov   (needs a
+#                   descriptive User-Agent header; coords, max 4 decimal places)
+#   - screening   : OFAC SDN list             https://www.treasury.gov/ofac/downloads/sdn.csv
+# The stubs are kept as a graceful fallback so --dry-run and offline runs still
+# work. Set LIVE_TOOLS=True (or pass --live-tools) to hit the real endpoints.
 # --------------------------------------------------------------------------- #
+LIVE_TOOLS = False
+NWS_ALERTS_URL = "https://api.weather.gov/alerts"
+OFAC_SDN_CSV_URL = "https://www.treasury.gov/ofac/downloads/sdn.csv"
+# NWS requires a real contact in the UA — CHANGE THIS to your app + email.
+NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "claims-copilot/0.1 (contact: you@example.com)")
+
+
+# ---- stubs (offline fallback) ----
 def tool_weather_cat(date: str, location: str) -> dict:
-    # TODO: replace with a live call, e.g. National Weather Service / NOAA.
-    return {
-        "tool": "weather_cat",
-        "date": date,
-        "location": location,
-        "event": "Flash Flood Warning in effect",
-        "severity": "moderate",
-        "source": "NWS (stubbed)",
-    }
+    return {"tool": "weather_cat", "date": date, "location": location,
+            "flood_alert": True, "alerts": [{"event": "Flash Flood Warning", "severity": "Severe"}],
+            "source": "STUB (set --live-tools for real NWS data)"}
 
 
 def tool_sanctions_screen(name: str) -> dict:
-    # TODO: replace with a live screen against the public OFAC SDN list.
-    return {"tool": "sanctions_screen", "name": name, "match": False, "list": "OFAC SDN (stubbed)"}
+    return {"tool": "sanctions_screen", "query": name, "match": False,
+            "hits": [], "source": "STUB (set --live-tools for real OFAC data)"}
 
 
-TOOLS = {"weather_cat": tool_weather_cat, "sanctions_screen": tool_sanctions_screen}
+# ---- pure parsing/matching (unit-testable without network) ----
+def _summarize_nws_alerts(features: list[dict], date: str | None = None) -> dict:
+    alerts = [{
+        "event": f.get("properties", {}).get("event"),
+        "severity": f.get("properties", {}).get("severity"),
+        "onset": f.get("properties", {}).get("onset"),
+        "ends": f.get("properties", {}).get("ends"),
+        "area": f.get("properties", {}).get("areaDesc"),
+    } for f in features]
+    flood = [a for a in alerts if (a["event"] or "").lower().find("flood") >= 0]
+    return {"tool": "weather_cat", "date": date, "alert_count": len(alerts),
+            "flood_alert": bool(flood), "alerts": alerts[:5], "source": "NWS api.weather.gov"}
+
+
+def _match_sdn(name: str, sdn: list[tuple], threshold: float = 0.85) -> dict:
+    """Token-based fuzzy screen. OFAC lists names as 'LAST, First', so we compare
+    on sorted token sets, not raw strings. Real screening additionally uses the
+    alt.csv aliases and calibrated fuzzy logic (e.g. Jaro-Winkler); tune here."""
+    import difflib
+
+    def toks(s: str) -> list[str]:
+        return sorted(re.findall(r"[a-z0-9]+", s.lower()))
+
+    qt = toks(name)
+    q, qset = " ".join(qt), set(qt)
+    hits = []
+    for nm, typ, prog in sdn:
+        nt = toks(nm)
+        if not nt:
+            continue
+        n, nset = " ".join(nt), set(nt)
+        seq = difflib.SequenceMatcher(None, q, n).ratio()
+        jacc = len(qset & nset) / len(qset | nset)
+        subset = bool(qset) and qset.issubset(nset)
+        score = max(seq, jacc, 0.95 if subset else 0.0)
+        if score >= threshold:
+            hits.append({"name": nm, "type": typ, "program": prog, "score": round(score, 3)})
+    hits.sort(key=lambda h: -h["score"])
+    return {"tool": "sanctions_screen", "query": name, "match": bool(hits),
+            "hits": hits[:5], "list_size": len(sdn), "source": "OFAC SDN"}
+
+
+# ---- live calls (network) ----
+def nws_weather_cat(lat: float, lon: float, date: str | None = None, *, timeout: int = 10) -> dict:
+    """Query NWS alerts at a point, optionally bounded to the day of `date`."""
+    import datetime
+    import requests
+    params = {"point": f"{round(lat, 4)},{round(lon, 4)}"}
+    if date:
+        d = datetime.date.fromisoformat(date)
+        params["start"] = f"{d}T00:00:00Z"
+        params["end"] = f"{d + datetime.timedelta(days=1)}T00:00:00Z"
+    r = requests.get(NWS_ALERTS_URL, params=params, timeout=timeout,
+                     headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"})
+    r.raise_for_status()
+    out = _summarize_nws_alerts(r.json().get("features", []), date)
+    out["point"] = [round(lat, 4), round(lon, 4)]
+    return out
+
+
+def load_ofac_sdn(url: str = OFAC_SDN_CSV_URL, *, timeout: int = 30, cache_path: str | None = "sdn_cache.csv") -> list[tuple]:
+    """Download (and cache) the public OFAC SDN list. Columns: ent_num, name,
+    type, program, ... ; null values are '-0-'. Aliases live in alt.csv."""
+    import csv
+    import io
+    import os as _os
+    import requests
+    if cache_path and _os.path.exists(cache_path):
+        text = open(cache_path, encoding="utf-8", errors="replace").read()
+    else:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": NWS_USER_AGENT})
+        r.raise_for_status()
+        text = r.text
+        if cache_path:
+            open(cache_path, "w", encoding="utf-8").write(text)
+    rows = []
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) >= 4 and row[1].strip() not in ("", "-0-"):
+            rows.append((row[1].strip(), row[2].strip(), row[3].strip()))
+    return rows
+
+
+def ofac_sanctions_screen(name: str, *, sdn: list[tuple] | None = None, threshold: float = 0.85) -> dict:
+    return _match_sdn(name, sdn if sdn is not None else load_ofac_sdn(), threshold)
+
+
+# ---- dispatcher: live when enabled, else stub; falls back to stub on any error ----
+# Demo inputs for the sample claim. In production these come from the claim /
+# policy record (the property is geocoded to lat/lon; the claimant name is known).
+_DEMO_LAT, _DEMO_LON, _DEMO_DATE, _DEMO_NAME = 30.2672, -97.7431, "2026-03-14", "John Roe"
+
+
+def call_realtime_tool(name: str) -> dict:
+    if name == "weather_cat":
+        if LIVE_TOOLS:
+            try:
+                return nws_weather_cat(_DEMO_LAT, _DEMO_LON, _DEMO_DATE)
+            except Exception as e:
+                return {**tool_weather_cat(_DEMO_DATE, "Austin, TX"), "live_error": f"{type(e).__name__}: {e}"}
+        return tool_weather_cat(_DEMO_DATE, "Austin, TX")
+    if name == "sanctions_screen":
+        if LIVE_TOOLS:
+            try:
+                return ofac_sanctions_screen(_DEMO_NAME)
+            except Exception as e:
+                return {**tool_sanctions_screen(_DEMO_NAME), "live_error": f"{type(e).__name__}: {e}"}
+        return tool_sanctions_screen(_DEMO_NAME)
+    return {"tool": name, "error": "unknown tool"}
 
 
 # --------------------------------------------------------------------------- #
@@ -505,13 +621,12 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
 
     # 4. REAL-TIME TOOLS
     realtime = {}
-    print("\n4) REAL-TIME TOOLS"); line()
+    print(f"\n4) REAL-TIME TOOLS  ({'LIVE' if LIVE_TOOLS else 'stub'})"); line()
     for name in plan.get("tools", []):
-        if name == "weather_cat":
-            realtime[name] = TOOLS[name]("2026-03-14", "Austin, TX")
-        elif name == "sanctions_screen":
-            realtime[name] = TOOLS[name]("John Roe")
-        print(f"   {name}: {realtime[name]}")
+        realtime[name] = call_realtime_tool(name)
+        summary = {k: realtime[name][k] for k in ("flood_alert", "match", "alert_count", "list_size", "source", "live_error")
+                   if k in realtime[name]}
+        print(f"   {name}: {summary}")
 
     # 5. DRAFT determination (LLM, grounded + cited)
     ev_block = "\n".join(f"[{d['id']}] ({d['source']}) {d['text']}" for d in evidence)
@@ -558,7 +673,7 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
 
 
 def main() -> None:
-    global REASONING_MODEL
+    global REASONING_MODEL, LIVE_TOOLS
     ap = argparse.ArgumentParser(description="Advanced-RAG insurance claims copilot")
     ap.add_argument("--dry-run", action="store_true",
                     help="run offline with canned LLM responses (no API key needed)")
@@ -567,6 +682,8 @@ def main() -> None:
     ap.add_argument("--embedder", default=os.environ.get("COPILOT_EMBEDDER", "none"),
                     choices=list(EMBEDDERS),
                     help="dense retriever fused into hybrid search (none = lexical only)")
+    ap.add_argument("--live-tools", action="store_true",
+                    help="call the real NWS + OFAC endpoints (runtime must allow egress)")
     args = ap.parse_args()
 
     if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -577,11 +694,12 @@ def main() -> None:
         )
 
     REASONING_MODEL = args.model
+    LIVE_TOOLS = args.live_tools
     mode = "DRY-RUN (offline, canned LLM)" if args.dry_run else f"LIVE API ({REASONING_MODEL})"
     retrieval = "BM25 + TF-IDF" + ("" if args.embedder == "none" else f" + {args.embedder} embeddings")
     print("=" * 78)
     print(f"CLAIMS COVERAGE COPILOT  —  mode: {mode}")
-    print(f"retrieval: {retrieval}")
+    print(f"retrieval: {retrieval}   |   real-time tools: {'LIVE (NWS + OFAC)' if LIVE_TOOLS else 'stub'}")
     print("=" * 78)
     print("CLAIM:\n  " + args.claim.replace("\n", "\n  ") + "\n")
 
