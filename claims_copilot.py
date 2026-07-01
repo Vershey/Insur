@@ -316,7 +316,9 @@ NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "claims-copilot/0.1 (contact: 
 # ---- stubs (offline fallback) ----
 def tool_weather_cat(date: str, location: str) -> dict:
     return {"tool": "weather_cat", "date": date, "location": location,
-            "flood_alert": True, "alerts": [{"event": "Flash Flood Warning", "severity": "Severe"}],
+            "flood_alert": True, "thunderstorm_alert": True,
+            "alerts": [{"event": "Flash Flood Warning", "severity": "Severe"},
+                       {"event": "Severe Thunderstorm Warning", "severity": "Severe"}],
             "source": "STUB (set --live-tools for real NWS data)"}
 
 
@@ -335,8 +337,10 @@ def _summarize_nws_alerts(features: list[dict], date: str | None = None) -> dict
         "area": f.get("properties", {}).get("areaDesc"),
     } for f in features]
     flood = [a for a in alerts if (a["event"] or "").lower().find("flood") >= 0]
+    tstorm = [a for a in alerts if (a["event"] or "").lower().find("thunderstorm") >= 0]
     return {"tool": "weather_cat", "date": date, "alert_count": len(alerts),
-            "flood_alert": bool(flood), "alerts": alerts[:5], "source": "NWS api.weather.gov"}
+            "flood_alert": bool(flood), "thunderstorm_alert": bool(tstorm),
+            "alerts": alerts[:5], "source": "NWS api.weather.gov"}
 
 
 def _match_sdn(name: str, sdn: list[tuple], threshold: float = 0.85) -> dict:
@@ -441,8 +445,9 @@ def call_realtime_tool(name: str) -> dict:
 # --------------------------------------------------------------------------- #
 PLANNER_SYSTEM = """You are the retrieval planner for an insurance claims copilot.
 Given a claim (FNOL), decide what to retrieve and which real-time tools to call.
-Available tools: "weather_cat" (weather/catastrophe by date+location),
-"sanctions_screen" (screen a named party).
+Available tools: "weather_cat" (weather/catastrophe by date+location — returns flood_alert
+and thunderstorm_alert booleans; call this whenever weather, wind, hail, lightning, or
+flooding may be relevant), "sanctions_screen" (screen a named party).
 Respond with ONLY a JSON object, no prose, in this schema:
 {
   "queries": ["3-5 short retrieval queries covering coverage, exclusions, prior claims"],
@@ -462,6 +467,10 @@ doc_id. Use PENDING when the proximate cause or a required fact is unconfirmed
 and a decision cannot yet be made; prefer PARTIAL when partial coverage clearly
 applies but open questions remain; use COVERED or DENIED only when the evidence
 is conclusive.
+If the weather tool reports thunderstorm_alert=true, note it explicitly: lightning
+strikes, wind damage, and hail are typically covered perils under dwelling and
+personal property coverage — cite the relevant policy doc and flag any open
+questions about whether the loss was caused by the storm.
 Respond with ONLY JSON in this schema:
 {
   "decision": "COVERED | PARTIAL | DENIED | PENDING",
@@ -624,9 +633,12 @@ def run(claim: str, retriever: HybridRetriever, llm: LLM) -> dict:
     print(f"\n4) REAL-TIME TOOLS  ({'LIVE' if LIVE_TOOLS else 'stub'})"); line()
     for name in plan.get("tools", []):
         realtime[name] = call_realtime_tool(name)
-        summary = {k: realtime[name][k] for k in ("flood_alert", "match", "alert_count", "list_size", "source", "live_error")
+        summary = {k: realtime[name][k] for k in ("flood_alert", "thunderstorm_alert", "match", "alert_count", "list_size", "source", "live_error")
                    if k in realtime[name]}
         print(f"   {name}: {summary}")
+        if realtime[name].get("thunderstorm_alert"):
+            print("   *** THUNDERSTORM WARNING active on loss date — notify insured; "
+                  "lightning/wind/hail damage may be covered under dwelling/personal property. ***")
 
     # 5. DRAFT determination (LLM, grounded + cited)
     ev_block = "\n".join(f"[{d['id']}] ({d['source']}) {d['text']}" for d in evidence)
